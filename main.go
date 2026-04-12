@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -59,6 +60,12 @@ func main() {
 		cmdSub(args)
 	case "channels":
 		cmdChannels()
+	case "logs":
+		cmdLogs(args)
+	case "stats":
+		cmdStats()
+	case "open":
+		cmdOpen(args)
 	case "token", "tokens":
 		cmdToken(args)
 	case "version", "-v", "--version":
@@ -89,6 +96,9 @@ Commands:
   channels            List all available notification channels
   token list          List your API tokens
   token create <name> Create a new API token
+  logs [-s src] [-f]  View recent logs (-f to follow)
+  stats               Hub stats (channels, counts, last push)
+  open <subdomain>    Open subdomain in browser (e.g. txid open dash)
   version             Show CLI version
   help                Show this message
 
@@ -435,6 +445,142 @@ func cmdToken(args []string) {
 	default:
 		die("unknown token subcommand: %s", args[0])
 	}
+}
+
+func cmdLogs(args []string) {
+	source := ""
+	follow := false
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "-s", "--source":
+			if i+1 < len(args) {
+				source = args[i+1]
+				i++
+			}
+		case "-f", "--follow":
+			follow = true
+		}
+	}
+
+	printLogs := func(seenIDs map[float64]bool) {
+		path := "/logs?limit=50"
+		if source != "" {
+			path += "&source=" + source
+		}
+		res, err := apiRequest("GET", path, nil)
+		if err != nil {
+			die("%v", err)
+		}
+		logs, _ := res["logs"].([]any)
+		// Reverse (newest last) for tail-like display
+		for i := len(logs) - 1; i >= 0; i-- {
+			l, _ := logs[i].(map[string]any)
+			id, _ := l["id"].(float64)
+			if seenIDs != nil {
+				if seenIDs[id] {
+					continue
+				}
+				seenIDs[id] = true
+			}
+			ts, _ := l["createdAt"].(float64)
+			src := str(l, "source")
+			level := str(l, "level")
+			msg := str(l, "message")
+			details := str(l, "details")
+			color := levelColor(level)
+			fmt.Printf("%s%s\033[0m %-24s %s%-5s\033[0m %s",
+				"\033[90m", time.Unix(int64(ts), 0).Format("01-02 15:04:05"),
+				src, color, level, msg)
+			if details != "" {
+				fmt.Printf(" \033[90m(%s)\033[0m", details)
+			}
+			fmt.Println()
+		}
+	}
+
+	if !follow {
+		printLogs(nil)
+		return
+	}
+
+	seen := make(map[float64]bool)
+	printLogs(seen)
+	for {
+		time.Sleep(3 * time.Second)
+		printLogs(seen)
+	}
+}
+
+func cmdStats() {
+	res, err := apiRequestList("GET", "/notifications/stats/public")
+	if err != nil {
+		die("%v", err)
+	}
+	fmt.Printf("%-18s %-20s %-6s %-6s %-8s %s\n", "CHANNEL", "NAME", "24h", "7d", "TOTAL", "LAST PUSH")
+	now := time.Now().Unix()
+	for _, it := range res {
+		m, _ := it.(map[string]any)
+		id := str(m, "id")
+		name := str(m, "name")
+		if len(name) > 18 {
+			name = name[:18]
+		}
+		c24, _ := m["count24h"].(float64)
+		c7d, _ := m["count7d"].(float64)
+		total, _ := m["totalCount"].(float64)
+		lastPush, _ := m["lastPush"].(float64)
+		age := "never"
+		if lastPush > 0 {
+			sec := now - int64(lastPush)
+			if sec < 3600 {
+				age = fmt.Sprintf("%dm ago", sec/60)
+			} else if sec < 86400 {
+				age = fmt.Sprintf("%dh ago", sec/3600)
+			} else {
+				age = fmt.Sprintf("%dd ago", sec/86400)
+			}
+		}
+		fmt.Printf("%-18s %-20s %-6d %-6d %-8d %s\n", id, name, int(c24), int(c7d), int(total), age)
+	}
+}
+
+func cmdOpen(args []string) {
+	if len(args) == 0 {
+		die("usage: txid open <subdomain>")
+	}
+	sub := args[0]
+	url := "https://" + sub + ".txid.uk"
+	if sub == "txid" || sub == "main" {
+		url = "https://txid.uk"
+	}
+	fmt.Println("Opening", url)
+	openers := [][]string{
+		{"xdg-open", url},
+		{"open", url},
+		{"cmd", "/c", "start", url},
+	}
+	for _, cmd := range openers {
+		if err := exec.Command(cmd[0], cmd[1:]...).Start(); err == nil {
+			return
+		}
+	}
+	fmt.Fprintf(os.Stderr, "Failed to open browser. Visit: %s\n", url)
+}
+
+func levelColor(level string) string {
+	switch level {
+	case "debug":
+		return "\033[90m"
+	case "info":
+		return "\033[32m"
+	case "warn":
+		return "\033[33m"
+	case "error":
+		return "\033[31m"
+	case "fatal":
+		return "\033[1;31m"
+	}
+	return "\033[0m"
 }
 
 // ─── Helpers ───
