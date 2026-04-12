@@ -26,6 +26,9 @@ README.md
 - `txid sub [channel]` - List or toggle subscriptions
 - `txid channels` - All notification channels
 - `txid token list/create <name>` - API token management
+- `txid logs [-s source] [-f]` - View/tail system logs
+- `txid stats` - Hub per-channel statistics
+- `txid open <subdomain>` - Open subdomain in browser
 
 ## Environment
 - `TXID_API` - Override API URL (default https://api.txid.uk)
