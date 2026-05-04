@@ -68,6 +68,10 @@ func main() {
 		cmdOpen(args)
 	case "token", "tokens":
 		cmdToken(args)
+	case "lib":
+		cmdLib(args)
+	case "push":
+		cmdPush(args)
 	case "version", "-v", "--version":
 		fmt.Printf("txid-cli %s\n", version)
 	case "help", "-h", "--help":
@@ -99,6 +103,10 @@ Commands:
   logs [-s src] [-f]  View recent logs (-f to follow)
   stats               Hub stats (channels, counts, last push)
   open <subdomain>    Open subdomain in browser (e.g. txid open dash)
+  lib status          Show your lib.txid.uk reading progress
+  push <ch> <title> [body]
+                      Push a notification to a channel
+                      (requires TXID_NOTIFICATION_SECRET in env)
   version             Show CLI version
   help                Show this message
 
@@ -544,6 +552,94 @@ func cmdStats() {
 	}
 }
 
+func cmdLib(args []string) {
+	if len(args) == 0 || args[0] != "status" {
+		die("usage: txid lib status")
+	}
+	res, err := apiRequest("GET", "/progress/lib", nil)
+	if err != nil {
+		die("%v", err)
+	}
+	progress, _ := res["progress"].(map[string]any)
+	updatedAt, _ := res["updatedAt"].(float64)
+	if len(progress) == 0 {
+		fmt.Println("No reading progress yet.")
+		fmt.Println("Visit https://lib.txid.uk and start reading.")
+		return
+	}
+
+	// Resolve book ids → titles in one batched call
+	ids := make([]string, 0, len(progress))
+	for id := range progress {
+		ids = append(ids, id)
+	}
+	books, _ := apiRequestList("GET", "/books/by-ids?ids="+strings.Join(ids, ","))
+	titles := map[string]string{}
+	for _, b := range books {
+		bm, _ := b.(map[string]any)
+		bid := fmt.Sprintf("%d", int(numFloat(bm, "id")))
+		titles[bid] = str(bm, "title")
+	}
+
+	fmt.Printf("%-6s %-7s %s\n", "BOOK", "PROG", "TITLE")
+	for id, p := range progress {
+		pm, _ := p.(map[string]any)
+		pct, _ := pm["percentage"].(float64)
+		title := titles[id]
+		if title == "" {
+			title = "(book #" + id + ")"
+		}
+		if len(title) > 64 {
+			title = title[:61] + "..."
+		}
+		fmt.Printf("%-6s %3d%%    %s\n", id, int(pct), title)
+	}
+	if updatedAt > 0 {
+		t := time.Unix(int64(updatedAt/1000), 0)
+		fmt.Printf("\nLast updated: %s\n", t.Format("2006-01-02 15:04 MST"))
+	}
+}
+
+func cmdPush(args []string) {
+	if len(args) < 2 {
+		die("usage: txid push <channel> <title> [body]")
+	}
+	secret := os.Getenv("TXID_NOTIFICATION_SECRET")
+	if secret == "" {
+		die("TXID_NOTIFICATION_SECRET env var is required for push")
+	}
+	channelID := args[0]
+	title := args[1]
+	body := ""
+	if len(args) >= 3 {
+		body = strings.Join(args[2:], " ")
+	}
+
+	payload := map[string]any{"channelId": channelID, "title": title}
+	if body != "" {
+		payload["body"] = body
+	}
+	data, _ := json.Marshal(payload)
+
+	req, err := http.NewRequest("POST", apiURL+"/notifications/push", bytes.NewReader(data))
+	if err != nil {
+		die("build request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Notification-Secret", secret)
+
+	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
+	if err != nil {
+		die("request: %v", err)
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		die("HTTP %d: %s", resp.StatusCode, respBody)
+	}
+	fmt.Printf("✓ pushed to %s\n", channelID)
+}
+
 func cmdOpen(args []string) {
 	if len(args) == 0 {
 		die("usage: txid open <subdomain>")
@@ -593,6 +689,11 @@ func die(format string, args ...any) {
 func str(m map[string]any, key string) string {
 	s, _ := m[key].(string)
 	return s
+}
+
+func numFloat(m map[string]any, key string) float64 {
+	f, _ := m[key].(float64)
+	return f
 }
 
 func shortPubkey(pk string) string {
