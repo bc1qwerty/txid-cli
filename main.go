@@ -4,6 +4,7 @@ package main
 
 import (
 	"bytes"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,7 +13,10 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
+
+	_ "modernc.org/sqlite"
 )
 
 const (
@@ -64,6 +68,21 @@ func main() {
 		cmdLogs(args)
 	case "stats":
 		cmdStats()
+	case "bots":
+		if len(args) > 0 {
+			switch args[0] {
+			case "start":
+				cmdBotsStart(args[1:])
+				return
+			case "stop":
+				cmdBotsStop(args[1:])
+				return
+			case "logs":
+				cmdBotsLogs(args[1:])
+				return
+			}
+		}
+		cmdBots(args)
 	case "open":
 		cmdOpen(args)
 	case "token", "tokens":
@@ -101,6 +120,7 @@ Commands:
   token list          List your API tokens
   token create <name> Create a new API token
   logs [-s src] [-f]  View recent logs (-f to follow)
+  bots                Monitor status of local txid-bots
   stats               Hub stats (channels, counts, last push)
   open <subdomain>    Open subdomain in browser (e.g. txid open dash)
   lib status          Show your lib.txid.uk reading progress
@@ -722,4 +742,218 @@ func encodeQuery(s string) string {
 		}
 	}
 	return out.String()
+}
+
+func cmdBots(args []string) {
+	home, _ := os.UserHomeDir()
+	
+	// Scan for .db files in subdirectories (depth 2)
+	var dbPaths []string
+	entries, _ := os.ReadDir(home)
+	for _, e := range entries {
+		if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
+			continue
+		}
+		
+		dirPath := filepath.Join(home, e.Name())
+		// Check root of subdir
+		subEntries, _ := os.ReadDir(dirPath)
+		for _, se := range subEntries {
+			if !se.IsDir() && strings.HasSuffix(se.Name(), ".db") {
+				dbPaths = append(dbPaths, filepath.Join(dirPath, se.Name()))
+			}
+			// Check one more level (e.g., bot/data/*.db)
+			if se.IsDir() && (se.Name() == "data" || se.Name() == "db") {
+				dataEntries, _ := os.ReadDir(filepath.Join(dirPath, se.Name()))
+				for _, de := range dataEntries {
+					if !de.IsDir() && strings.HasSuffix(de.Name(), ".db") {
+						dbPaths = append(dbPaths, filepath.Join(dirPath, se.Name(), de.Name()))
+					}
+				}
+			}
+		}
+	}
+
+	fmt.Printf("%-18s %-16s %-16s %s\n", "BOT (DB NAME)", "LAST SEEN", "LAST SENT", "STATUS")
+	fmt.Printf("%-18s %-16s %-16s %s\n", "──────────────", "─────────", "─────────", "──────")
+
+	foundCount := 0
+	for _, path := range dbPaths {
+		db, err := sql.Open("sqlite", path)
+		if err != nil {
+			continue
+		}
+
+		// Verify this is a bot framework DB by checking for bot_seen table
+		var tblName string
+		err = db.QueryRow("SELECT name FROM sqlite_master WHERE type='table' AND name='bot_seen'").Scan(&tblName)
+		if err != nil || tblName == "" {
+			db.Close()
+			continue
+		}
+
+		foundCount++
+		botName := filepath.Base(path)
+		botBaseName := strings.TrimSuffix(botName, ".db")
+		status := "✅ OK"
+		lastSeenStr := "never"
+		lastSentStr := "never"
+
+		// Liveness check via PID
+		pidFile := filepath.Join(home, ".txid-bots", botBaseName+".pid")
+		pidData, err := os.ReadFile(pidFile)
+		if err == nil {
+			var pid int
+			if _, err := fmt.Sscanf(string(pidData), "%d", &pid); err == nil {
+				if killErr := syscall.Kill(pid, 0); killErr != nil {
+					status = "❌ DEAD"
+				}
+			}
+		} else {
+			status = "⚠️ NO PID"
+		}
+
+		// Query last seen
+		var lastSeen int64
+		err = db.QueryRow("SELECT MAX(seen_at) FROM bot_seen").Scan(&lastSeen)
+		if err == nil && lastSeen > 0 {
+			lastSeenStr = time.Unix(lastSeen, 0).Format("01-02 15:04")
+			if time.Now().Unix()-lastSeen > 86400 {
+				status = "⚠️ STALE"
+			}
+		}
+
+		// Query last sent
+		var lastSent int64
+		err = db.QueryRow("SELECT MAX(sent_at) FROM bot_sent").Scan(&lastSent)
+		if err == nil && lastSent > 0 {
+			lastSentStr = time.Unix(lastSent, 0).Format("01-02 15:04")
+		}
+
+		db.Close()
+		fmt.Printf("%-18s %-16s %-16s %s\n", botName, lastSeenStr, lastSentStr, status)
+	}
+
+	if foundCount == 0 {
+		fmt.Println("No active bot databases found.")
+	}
+}
+
+type botRef struct {
+	id      string
+	dir     string
+	cmd     string
+	isOneShot bool
+}
+
+func getManagedBots() []botRef {
+	home, _ := os.UserHomeDir()
+	return []botRef{
+		{"news-summary", filepath.Join(home, "news-summary-bot"), "./news-summary-bot", false},
+		{"etoland", filepath.Join(home, "etoland-bot"), "./etoland-bot serve", false},
+		{"safety-alarm", filepath.Join(home, "safety_alarm_bot"), "./safety-alarm-bot", true},
+		{"social-feed", filepath.Join(home, "social-feed-bot"), "./social-feed-bot", false},
+		{"food-recall", filepath.Join(home, "food-recall-bot"), "./food-recall-bot", false},
+		{"bid-alert", filepath.Join(home, "bid-alert-bot"), "./bid-alert-bot", false},
+		{"realestate", filepath.Join(home, "realestate-alert-bot"), "./realestate-alert-bot", false},
+	}
+}
+
+func cmdBotsStart(args []string) {
+	home, _ := os.UserHomeDir()
+	managedBots := getManagedBots()
+	target := "all"
+	if len(args) > 0 {
+		target = args[0]
+	}
+
+	logDir := filepath.Join(home, ".txid-bots", "logs")
+	os.MkdirAll(logDir, 0755)
+
+	for _, b := range managedBots {
+		if target != "all" && b.id != target {
+			continue
+		}
+
+		fmt.Printf("Starting %s... ", b.id)
+		
+		// 1. Build
+		buildCmd := exec.Command("go", "build", "-o", b.id)
+		if b.id == "etoland" {
+			buildCmd = exec.Command("go", "build", "-o", b.id, "./cmd/bot")
+		}
+		buildCmd.Dir = b.dir
+		if err := buildCmd.Run(); err != nil {
+			fmt.Printf("❌ build failed: %v\n", err)
+			continue
+		}
+
+		// 2. Start
+		logFile := filepath.Join(logDir, b.id+".log")
+		f, _ := os.OpenFile(logFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+		
+		cmdParts := strings.Split(b.cmd, " ")
+		runCmd := exec.Command(filepath.Join(b.dir, b.id), cmdParts[1:]...)
+		runCmd.Dir = b.dir
+		runCmd.Stdout = f
+		runCmd.Stderr = f
+		runCmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+		
+		if err := runCmd.Start(); err != nil {
+			fmt.Printf("❌ start failed: %v\n", err)
+		} else {
+			fmt.Printf("✅ started (PID: %d)\n", runCmd.Process.Pid)
+			// Save PID for stopping later
+			pidFile := filepath.Join(home, ".txid-bots", b.id+".pid")
+			os.WriteFile(pidFile, []byte(fmt.Sprintf("%d", runCmd.Process.Pid)), 0644)
+		}
+	}
+}
+
+func cmdBotsStop(args []string) {
+	home, _ := os.UserHomeDir()
+	managedBots := getManagedBots()
+	target := "all"
+	if len(args) > 0 {
+		target = args[0]
+	}
+
+	for _, b := range managedBots {
+		if target != "all" && b.id != target {
+			continue
+		}
+
+		pidFile := filepath.Join(home, ".txid-bots", b.id+".pid")
+		data, err := os.ReadFile(pidFile)
+		if err != nil {
+			continue
+		}
+		
+		fmt.Printf("Stopping %s (PID: %s)... ", b.id, string(data))
+		killCmd := exec.Command("kill", strings.TrimSpace(string(data)))
+		if err := killCmd.Run(); err != nil {
+			fmt.Printf("❌ failed: %v (already dead?)\n", err)
+		} else {
+			fmt.Println("✅ stopped")
+		}
+		os.Remove(pidFile)
+	}
+}
+
+func cmdBotsLogs(args []string) {
+	if len(args) == 0 {
+		die("usage: txid bots logs <bot-id>")
+	}
+	home, _ := os.UserHomeDir()
+	logFile := filepath.Join(home, ".txid-bots", "logs", args[0]+".log")
+	
+	if _, err := os.Stat(logFile); os.IsNotExist(err) {
+		die("no log file found for %s", args[0])
+	}
+
+	fmt.Printf("--- Showing logs for %s (Ctrl+C to stop) ---\n", args[0])
+	tailCmd := exec.Command("tail", "-f", "-n", "50", logFile)
+	tailCmd.Stdout = os.Stdout
+	tailCmd.Stderr = os.Stderr
+	tailCmd.Run()
 }
