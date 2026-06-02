@@ -1,3 +1,4 @@
 txid
 *.token
 .env
+/txid-cli
